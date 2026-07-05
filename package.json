@@ -1,0 +1,17 @@
+{
+  "name": "schembuilder",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Dependency-free Node.js toolkit for generating and previewing WorldEdit/Sponge .schem files.",
+  "type": "module",
+  "main": "schem-builder.mjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "example": "node schem-builder.mjs example out/quick-example.schem",
+    "scene": "node schem-builder.mjs run example-scene.mjs out/example-scene.schem",
+    "preview": "node render-preview.mjs example-scene.mjs out/example-scene",
+    "test": "node test.mjs"
+  }
+}
