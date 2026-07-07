@@ -22,12 +22,167 @@ const TAG = {
 // .schem stores Width/Height/Length as shorts.
 const MAX_DIMENSION = 32767;
 
+// ---------------------------------------------------------------------------
+// Block registry: every block in the game with its state schema and average
+// texture color, generated from Mojang's own assets by
+// tools/generate-block-data.mjs. Optional — without the file, validation is
+// skipped and the color helpers are unavailable.
+
+let REGISTRY = null;
+let REGISTRY_VERSION = null;
+try {
+  const parsed = JSON.parse(fs.readFileSync(new URL("./block-data.json", import.meta.url), "utf8"));
+  REGISTRY = parsed.blocks;
+  REGISTRY_VERSION = parsed.mcVersion;
+} catch {
+  // block-data.json missing: library still works, just without validation
+}
+
+export function registryInfo() {
+  return REGISTRY ? { mcVersion: REGISTRY_VERSION, blocks: Object.keys(REGISTRY).length } : null;
+}
+
+function levenshtein(a, b, cap) {
+  if (Math.abs(a.length - b.length) >= cap) return cap;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
+function suggestBlock(plain) {
+  let best = null;
+  let bestD = 4; // suggestions further than 3 edits away are noise
+  for (const key of Object.keys(REGISTRY)) {
+    const d = levenshtein(plain, key, bestD);
+    if (d < bestD) {
+      bestD = d;
+      best = key;
+    }
+  }
+  return best;
+}
+
+function computeBlockError(full) {
+  const bracket = full.indexOf("[");
+  const base = bracket >= 0 ? full.slice(0, bracket) : full;
+  if (!base.startsWith("minecraft:")) return null; // other namespaces: not validated
+  const plain = base.slice("minecraft:".length);
+  const rec = REGISTRY[plain];
+  if (!rec) {
+    const hint = suggestBlock(plain);
+    return `Unknown block "${base}" (Minecraft ${REGISTRY_VERSION})${hint ? ` — did you mean "${hint}"?` : ""}`;
+  }
+  if (bracket >= 0) {
+    if (!full.endsWith("]")) return `Malformed block states in "${full}"`;
+    const props = rec.p ?? {};
+    for (const pair of full.slice(bracket + 1, -1).split(",")) {
+      const eq = pair.indexOf("=");
+      const key = eq > 0 ? pair.slice(0, eq).trim() : pair.trim();
+      const value = eq > 0 ? pair.slice(eq + 1).trim() : "";
+      if (!(key in props)) {
+        const keys = Object.keys(props);
+        return `Block "${plain}" has no state "${key}"${keys.length ? ` (valid: ${keys.join(", ")})` : " (it has no states)"}`;
+      }
+      if (!props[key].includes(value)) {
+        return `Invalid value "${value}" for "${plain}[${key}=...]" (valid: ${props[key].join(", ")})`;
+      }
+    }
+  }
+  return null;
+}
+
+const validationCache = new Map();
+
+// Returns null when the block string is valid (or can't be checked: other
+// namespace, or no registry file), else a human-readable error message.
+export function blockError(name) {
+  if (!REGISTRY) return null;
+  let msg = validationCache.get(name);
+  if (msg === undefined) {
+    msg = computeBlockError(name);
+    validationCache.set(name, msg);
+  }
+  return msg;
+}
+
+// Average texture color of a block as [r, g, b], or null when unknown.
+// States are ignored: blockColor("oak_stairs[facing=east]") works.
+export function blockColor(name) {
+  if (!REGISTRY) return null;
+  let full = block(name);
+  const bracket = full.indexOf("[");
+  if (bracket >= 0) full = full.slice(0, bracket);
+  if (!full.startsWith("minecraft:")) return null;
+  const rec = REGISTRY[full.slice("minecraft:".length)];
+  return rec?.c ? [...rec.c] : null;
+}
+
+function parseColor(c) {
+  if (Array.isArray(c) && c.length === 3) return c;
+  if (typeof c === "string") {
+    const hex = c.startsWith("#") ? c.slice(1) : c;
+    if (/^[0-9a-fA-F]{6}$/.test(hex)) {
+      return [parseInt(hex.slice(0, 2), 16), parseInt(hex.slice(2, 4), 16), parseInt(hex.slice(4, 6), 16)];
+    }
+    const fromBlock = blockColor(c);
+    if (fromBlock) return fromBlock;
+  }
+  throw new Error(`Cannot interpret color ${JSON.stringify(c)} (use [r,g,b], "#rrggbb", or a block name)`);
+}
+
+function colorDistance(a, b) {
+  const dr = a[0] - b[0], dg = a[1] - b[1], db = a[2] - b[2];
+  return 2 * dr * dr + 4 * dg * dg + 3 * db * db; // eye-weighted: green counts most
+}
+
+// The block whose average texture color is closest to `color` ([r,g,b],
+// "#rrggbb", or another block name). By default only full opaque cubes are
+// considered — the safe palette for pixel art and organic shading. Options:
+// { all: true } to include every block, { exclude: [names] }, { count: N }
+// to get the N closest as an array.
+export function nearestBlock(color, options = {}) {
+  if (!REGISTRY) throw new Error("nearestBlock requires block-data.json (run: node tools/generate-block-data.mjs)");
+  const target = parseColor(color);
+  const exclude = new Set((options.exclude ?? []).map((n) => block(n).replace("minecraft:", "")));
+  const ranked = [];
+  for (const [name, rec] of Object.entries(REGISTRY)) {
+    if (!rec.c || exclude.has(name)) continue;
+    if (!options.all && !rec.q) continue;
+    ranked.push([colorDistance(target, rec.c), name]);
+  }
+  if (!ranked.length) throw new Error("No candidate blocks left after filtering");
+  ranked.sort((a, b) => a[0] - b[0]);
+  if (options.count == null) return `minecraft:${ranked[0][1]}`;
+  return ranked.slice(0, options.count).map(([, name]) => `minecraft:${name}`);
+}
+
+// A block palette fading from one color to another in `steps` steps. Ends
+// accept anything parseColor takes, including block names:
+// gradient("red_concrete", "#000000", 6). Takes nearestBlock's options.
+export function gradient(from, to, steps, options = {}) {
+  if (!Number.isInteger(steps) || steps < 2) throw new Error("gradient needs an integer steps >= 2");
+  const a = parseColor(from);
+  const b = parseColor(to);
+  const out = [];
+  for (let i = 0; i < steps; i++) {
+    const t = i / (steps - 1);
+    out.push(nearestBlock([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t], options));
+  }
+  return out;
+}
+
 export function block(name) {
   if (name === "air" || name === "minecraft:air") return "minecraft:air";
   if (typeof name !== "string" || !name.length) {
     throw new Error(`Invalid block name: ${String(name)}`);
   }
-  return name.startsWith("minecraft:") ? name : `minecraft:${name}`;
+  return name.includes(":") ? name : `minecraft:${name}`;
 }
 
 // Compose or merge block states: withState("lantern", { hanging: true })
@@ -300,6 +455,7 @@ export function loadSchem(filePath) {
     name: typeof metaName === "string" ? metaName : path.basename(filePath, path.extname(filePath)),
     dataVersion: root.DataVersion ?? 3465,
     offset: root.Offset && root.Offset.length === 3 ? [...root.Offset] : [0, 0, 0],
+    validate: false, // files from other game versions may name blocks we don't know
   });
 
   const total = width * height * length;
@@ -378,6 +534,10 @@ export class Schem {
     this.offset = options.offset ?? [0, 0, 0];
     this.seed = options.seed ?? 0;
     this.strict = options.strict ?? false;
+    // Validate block names and states against the registry on every write
+    // (throws with a suggestion on typos). Off when block-data.json is absent;
+    // pass { validate: false } to opt out (loadSchem does, so old files load).
+    this.validate = options.validate ?? true;
     this.droppedWrites = 0;
     this.air = "minecraft:air";
     this.blocks = new Array(width * height * length).fill(this.air);
@@ -393,6 +553,10 @@ export class Schem {
 
   // Internal fast path: integer coordinates, already-resolved block name.
   putResolved(x, y, z, name) {
+    if (this.validate) {
+      const err = blockError(name);
+      if (err) throw new Error(err);
+    }
     if (this.inBounds(x, y, z)) this.blocks[this.index(x, y, z)] = name;
     else this.dropWrite(x, y, z);
     return this;
@@ -413,8 +577,7 @@ export class Schem {
       this.dropWrite(ix, iy, iz);
       return this;
     }
-    this.blocks[this.index(ix, iy, iz)] = block(name);
-    return this;
+    return this.putResolved(ix, iy, iz, block(name));
   }
 
   // Translated view: same drawing API, local coordinates. See Frame.
@@ -438,8 +601,19 @@ export class Schem {
     return this.set(x, y, z, materialAt(materialOrPalette, x, y, z, this.seed));
   }
 
+  // Validates a resolved palette against the registry (memoized per name).
+  checkPalette(palette) {
+    if (this.validate) {
+      for (const name of palette) {
+        const err = blockError(name);
+        if (err) throw new Error(err);
+      }
+    }
+    return palette;
+  }
+
   fill(x1, y1, z1, x2, y2, z2, materialOrPalette) {
-    const palette = paletteOf(materialOrPalette);
+    const palette = this.checkPalette(paletteOf(materialOrPalette));
     const single = palette.length === 1 ? palette[0] : null;
     const ax = Math.max(0, Math.min(Math.round(x1), Math.round(x2)));
     const bx = Math.min(this.width - 1, Math.max(Math.round(x1), Math.round(x2)));
@@ -587,25 +761,50 @@ export class Schem {
     return this.ellipsoid(cx, cy, cz, radius, radius, radius, materialOrPalette, options);
   }
 
+  // options.yaw / pitch / roll (degrees) tilt the ellipsoid: yaw spins it
+  // around Y (90 = the same quarter-turn as paste's rotate: 1), pitch tips the
+  // top toward +Z, roll tips it toward +X. Applied roll, then pitch, then yaw.
   ellipsoid(cx, cy, cz, rx, ry, rz, materialOrPalette, options = {}) {
     const solid = options.solid ?? true;
     const noise = options.noise ?? 0;
     const palette = paletteOf(materialOrPalette);
-    let yLo = Math.floor(cy - ry - 1);
-    let yHi = Math.ceil(cy + ry + 1);
+    const yaw = ((options.yaw ?? 0) * Math.PI) / 180;
+    const pitch = ((options.pitch ?? 0) * Math.PI) / 180;
+    const roll = ((options.roll ?? 0) * Math.PI) / 180;
+    const rotated = yaw !== 0 || pitch !== 0 || roll !== 0;
+    const rMax = Math.max(rx, ry, rz);
+    const bx = rotated ? rMax : rx;
+    const by = rotated ? rMax : ry;
+    const bz = rotated ? rMax : rz;
+    // inverse rotation: undo yaw (around Y), then pitch (around X), then roll (around Z)
+    const cyw = Math.cos(-yaw), syw = Math.sin(-yaw);
+    const cpt = Math.cos(-pitch), spt = Math.sin(-pitch);
+    const crl = Math.cos(-roll), srl = Math.sin(-roll);
+    let yLo = Math.floor(cy - by - 1);
+    let yHi = Math.ceil(cy + by + 1);
     if (options.minY != null) yLo = Math.max(yLo, Math.ceil(options.minY));
     if (options.maxY != null) yHi = Math.min(yHi, Math.floor(options.maxY));
     yLo = Math.max(0, yLo);
     yHi = Math.min(this.height - 1, yHi);
-    const z0 = Math.max(0, Math.floor(cz - rz - 1));
-    const z1 = Math.min(this.length - 1, Math.ceil(cz + rz + 1));
-    const x0 = Math.max(0, Math.floor(cx - rx - 1));
-    const x1 = Math.min(this.width - 1, Math.ceil(cx + rx + 1));
+    const z0 = Math.max(0, Math.floor(cz - bz - 1));
+    const z1 = Math.min(this.length - 1, Math.ceil(cz + bz + 1));
+    const x0 = Math.max(0, Math.floor(cx - bx - 1));
+    const x1 = Math.min(this.width - 1, Math.ceil(cx + bx + 1));
 
     for (let y = yLo; y <= yHi; y++) {
       for (let z = z0; z <= z1; z++) {
         for (let x = x0; x <= x1; x++) {
-          const d = ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 + ((z - cz) / rz) ** 2;
+          let dx = x - cx, dy = y - cy, dz = z - cz;
+          if (rotated) {
+            let tx = dx * cyw - dz * syw;
+            let tz = dx * syw + dz * cyw;
+            let ty = dy * cpt - tz * spt;
+            tz = dy * spt + tz * cpt;
+            dx = tx * crl + ty * srl;
+            dy = ty * crl - tx * srl;
+            dz = tz;
+          }
+          const d = (dx / rx) ** 2 + (dy / ry) ** 2 + (dz / rz) ** 2;
           const n = (hash3(x, y, z, this.seed) - 0.5) * noise;
           if (solid ? d <= 1 + n : d <= 1 + n && d >= (options.shellMin ?? 0.64) + n) {
             this.putResolved(x, y, z, pick(palette, x, y, z, this.seed));
@@ -651,6 +850,47 @@ export class Schem {
   // Single-layer horizontal disc (ponds, plazas, tower floors).
   discY(cx, cz, y, radius, materialOrPalette, options = {}) {
     return this.cylinderY(cx, cz, y, y, radius, materialOrPalette, options);
+  }
+
+  // Torus (ring). majorRadius is the distance from the center to the middle of
+  // the tube; minorRadius is the tube's own radius. options.axis picks the
+  // axis the ring wraps around: "y" (default) lays it flat, "x" / "z" stand it
+  // upright. options.noise roughens the surface like the other shapes.
+  torus(cx, cy, cz, majorRadius, minorRadius, materialOrPalette, options = {}) {
+    const palette = paletteOf(materialOrPalette);
+    const axis = options.axis ?? "y";
+    if (axis !== "x" && axis !== "y" && axis !== "z") {
+      throw new Error(`Unknown torus axis "${axis}" (expected "x", "y" or "z")`);
+    }
+    const noise = options.noise ?? 0;
+    const ring = majorRadius + minorRadius + Math.abs(noise) + 1;
+    const tube = minorRadius + Math.abs(noise) + 1;
+    const bx = axis === "x" ? tube : ring;
+    const by = axis === "y" ? tube : ring;
+    const bz = axis === "z" ? tube : ring;
+    const x0 = Math.max(0, Math.floor(cx - bx));
+    const x1 = Math.min(this.width - 1, Math.ceil(cx + bx));
+    const y0 = Math.max(0, Math.floor(cy - by));
+    const y1 = Math.min(this.height - 1, Math.ceil(cy + by));
+    const z0 = Math.max(0, Math.floor(cz - bz));
+    const z1 = Math.min(this.length - 1, Math.ceil(cz + bz));
+
+    for (let y = y0; y <= y1; y++) {
+      for (let z = z0; z <= z1; z++) {
+        for (let x = x0; x <= x1; x++) {
+          const dx = x - cx, dy = y - cy, dz = z - cz;
+          let inPlane, along;
+          if (axis === "y") { inPlane = Math.hypot(dx, dz); along = dy; }
+          else if (axis === "x") { inPlane = Math.hypot(dy, dz); along = dx; }
+          else { inPlane = Math.hypot(dx, dy); along = dz; }
+          const d = Math.hypot(inPlane - majorRadius, along);
+          if (d <= minorRadius + (hash3(x, y, z, this.seed) - 0.5) * noise) {
+            this.putResolved(x, y, z, pick(palette, x, y, z, this.seed));
+          }
+        }
+      }
+    }
+    return this;
   }
 
   // Stamps another Schem into this one at the given offset. Air cells in the
@@ -967,6 +1207,7 @@ export class Frame {
 
   cylinderY(cx, cz, y1, y2, r, m, o) { this.schem.cylinderY(cx + this.ox, cz + this.oz, y1 + this.oy, y2 + this.oy, r, m, o); return this; }
   discY(cx, cz, y, r, m, o) { this.schem.discY(cx + this.ox, cz + this.oz, y + this.oy, r, m, o); return this; }
+  torus(cx, cy, cz, R, r, m, o) { this.schem.torus(cx + this.ox, cy + this.oy, cz + this.oz, R, r, m, o); return this; }
   frustumY(cx, cz, y1, y2, r1, r2, m, o) { this.schem.frustumY(cx + this.ox, cz + this.oz, y1 + this.oy, y2 + this.oy, r1, r2, m, o); return this; }
   stampLayers(x, y, z, legend, layers) { this.schem.stampLayers(x + this.ox, y + this.oy, z + this.oz, legend, layers); return this; }
   paste(other, dx = 0, dy = 0, dz = 0, o) { this.schem.paste(other, dx + this.ox, dy + this.oy, dz + this.oz, o); return this; }
@@ -995,7 +1236,7 @@ export async function runSceneModule(modulePath) {
   if (typeof builder !== "function") {
     throw new Error(`${modulePath} must export default function or named build function`);
   }
-  return builder({ Schem, block, blocks, withState, stairs, hash3, pick, paletteOf, materialAt, loadSchem, prefabs });
+  return builder({ Schem, block, blocks, withState, stairs, hash3, pick, paletteOf, materialAt, loadSchem, prefabs, blockColor, nearestBlock, gradient, blockError, registryInfo });
 }
 
 // Loads a .schem file or runs a scene module, returning a Schem.
@@ -1016,9 +1257,10 @@ async function main(argv) {
   node schem-builder.mjs run <scene.mjs> <out.schem>
   node schem-builder.mjs stats <file.schem>
   node schem-builder.mjs slice <scene.mjs|file.schem> y=6 [x=3 z=4 ...] [--full]
+  node schem-builder.mjs nearest <#rrggbb|block_name> [count] [--all]
 
 Scene modules should export:
-  export default function ({ Schem, blocks, block, withState, stairs, prefabs, pick, hash3 }) { return new Schem(...); }
+  export default function ({ Schem, blocks, block, withState, stairs, prefabs, pick, hash3, nearestBlock, gradient, blockColor }) { return new Schem(...); }
 `);
     return;
   }
@@ -1068,6 +1310,18 @@ Scene modules should export:
       return schem.sliceText(m[1], Number(m[2]), { trim });
     });
     console.log(out.join("\n\n"));
+    return;
+  }
+
+  if (cmd === "nearest") {
+    if (!arg1) throw new Error("Usage: node schem-builder.mjs nearest <#rrggbb|r,g,b|block_name> [count] [--all]");
+    const target = /^\d+,\d+,\d+$/.test(arg1) ? arg1.split(",").map(Number) : arg1;
+    const count = Number.isInteger(Number(arg2)) && Number(arg2) > 0 ? Number(arg2) : 8;
+    const names = nearestBlock(target, { count, all: rest.includes("--all") });
+    for (const name of names) {
+      const c = blockColor(name);
+      console.log(`${name}  rgb(${c.join(", ")})`);
+    }
     return;
   }
 

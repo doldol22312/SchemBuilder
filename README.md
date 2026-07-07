@@ -10,12 +10,19 @@ the binary `.schem` details. The toolkit handles:
 - gzip compression
 - common geometry helpers
 - orthographic PNG previews, so you can iterate visually without launching Minecraft
+- the full block registry: every block name and state is validated on write
+  (typos throw with a suggestion), and every block has its real average texture
+  color for previews and for the `nearestBlock` / `gradient` palette helpers
 
 ## Files
 
-- `schem-builder.mjs` — the library and CLI (build, run scene modules, stats, slices)
+- `schem-builder.mjs` — the library and CLI (build, run scene modules, stats, slices, nearest)
 - `prefabs.mjs` — higher-level parts: gable roofs, stair runs, trees, terrain heightmaps
 - `render-preview.mjs` — renders PNG previews of a scene module or `.schem` file
+- `block-data.json` — generated registry: every block's state schema and average
+  texture color (validation and color helpers turn off gracefully if it's deleted)
+- `tools/generate-block-data.mjs` — regenerates `block-data.json` from Mojang's
+  published client assets and misode/mcmeta's data-generator summary
 - `example-scene.mjs` — a small demo scene that uses most of the API
 - `test.mjs` — self-tests (`npm test`)
 
@@ -44,7 +51,7 @@ not load directly from this output folder.
 Write a scene file that exports a function. Return a `Schem` instance.
 
 ```js
-export default function ({ Schem, blocks, block, withState, stairs, prefabs, pick, hash3 }) {
+export default function ({ Schem, blocks, block, withState, stairs, prefabs, pick, hash3, nearestBlock, gradient, blockColor }) {
   const s = new Schem(64, 48, 64, {
     name: "agent scene",
     offset: [-32, 0, -32],
@@ -97,19 +104,26 @@ Orientation (also printed with each file):
 - `left` — from the west (-X) looking east; south (+Z) is right
 - `top` — from above looking down; east (+X) is right, south (+Z) is down
 
-Glass and water render translucent. Every alias in `blocks` has a real color;
-unknown blocks get a deterministic fallback color and are listed at the end of
-the run so you can add proper entries to `COLORS`.
+Glass and water render translucent. Every block in the game renders with its
+real color: hand-tuned entries for the common building blocks, and the
+generated registry (`block-data.json`, average texture colors from Mojang's
+assets) for everything else. Shaped variants (stairs, slabs, walls, fences,
+panes, carpet, `waxed_` copper) inherit their base block's color. Only blocks
+from other namespaces (mods) get a deterministic fallback color, listed at the
+end of the run.
 
 ## Builder API
 
 `new Schem(width, height, length, options)`
 
-Creates an empty schematic. Options: `name`, `offset`, `dataVersion`, `seed`, `strict`.
+Creates an empty schematic. Options: `name`, `offset`, `dataVersion`, `seed`, `strict`, `validate`.
 Dimensions must be integers in 1..32767 (the `.schem` format stores them as shorts);
 violations throw immediately rather than at save time. With `strict: true`, any
 write that lands outside the schematic throws; otherwise such writes are counted
-in `stats().droppedWrites`.
+in `stats().droppedWrites`. Block names and states are validated against the
+registry on every write — a typo throws immediately with a suggestion instead of
+producing a file Minecraft rejects; pass `validate: false` to opt out (blocks
+from other namespaces are always allowed).
 
 `s.set(x, y, z, blockName)` / `s.get(x, y, z)`
 
@@ -149,7 +163,10 @@ Solid sphere; takes the same options as `ellipsoid`.
 `s.ellipsoid(cx, cy, cz, rx, ry, rz, palette, options)`
 
 Ellipsoid. Useful options: `{ solid: true, noise: 0.2 }`, `{ solid: false, shellMin: 0.78 }`,
-and `minY` / `maxY` to clip the shape vertically.
+and `minY` / `maxY` to clip the shape vertically. `yaw` / `pitch` / `roll`
+(degrees) tilt the whole shape — `yaw` spins it around Y (90 = the same
+quarter-turn as `paste`'s `rotate: 1`), `pitch` tips the top toward +Z, `roll`
+toward +X — so tilted limbs and leaning forms don't need manual voxel math.
 
 `s.dome(cx, cy, cz, rx, ry, rz, palette, options)`
 
@@ -167,6 +184,14 @@ Single-layer horizontal disc (ponds, plazas, tower floors).
 `s.frustumY(cx, cz, y1, y2, radius1, radius2, palette, options)`
 
 Tapered vertical cylinder. Use `{ shell: true, thickness: 2 }` for towers.
+
+`s.torus(cx, cy, cz, majorRadius, minorRadius, palette, options)`
+
+Torus (ring). `majorRadius` is the distance from the center to the middle of
+the tube, `minorRadius` the tube's own radius. `options.axis` picks the axis
+the ring wraps around: `"y"` (default) lays it flat — a halo, an accretion
+disc — while `"x"` / `"z"` stand it upright like a portal ring. `noise`
+roughens the surface like the other shapes.
 
 `s.paste(other, dx, dy, dz, options)`
 
@@ -220,6 +245,36 @@ s.set(13, 5, 10, "minecraft:lantern[hanging=false,waterlogged=false]");
 - `withState(name, states)` composes or merges `[key=value]` block states.
 - `stairs(material, facing, half, shape)` builds a fully-qualified stairs string;
   `facing` is the ascending direction.
+
+Every block in the game works — the aliases are just shorthands. Writes are
+checked against the generated registry (Minecraft 26.2, all 1196 blocks):
+unknown names throw with a "did you mean" suggestion, and invalid state keys or
+values throw listing the valid ones.
+
+## Color helpers
+
+The registry stores every block's average texture color, which turns block
+choice into a computation instead of recall (scene modules receive all three):
+
+```js
+blockColor("gold_block");                 // [246, 208, 62]
+nearestBlock("#3a76c4");                  // closest full opaque cube to that color
+nearestBlock([58, 118, 196], { count: 5, exclude: ["blue_wool"] });
+gradient("deepslate", "snow_block", 7);   // 7-step palette between two blocks
+```
+
+`nearestBlock` and `gradient` only suggest full opaque cubes by default — the
+safe palette for pixel art and organic shading; pass `{ all: true }` to widen.
+The same lookup is available from the shell:
+
+```powershell
+node .\schem-builder.mjs nearest "#8040ff" 8
+node .\schem-builder.mjs nearest red_concrete 5 --all
+```
+
+To regenerate `block-data.json` for a newer Minecraft version:
+`node tools/generate-block-data.mjs [--version 26.2]` (downloads Mojang's
+client assets and the misode/mcmeta block summary, caches in `out/gen`).
 
 ## ASCII floor plans
 

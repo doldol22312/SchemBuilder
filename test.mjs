@@ -1,6 +1,7 @@
 // Self-tests for schem-builder. Run with: node test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -14,6 +15,11 @@ import {
   buildExample,
   loadSchem,
   parseNbt,
+  blockError,
+  blockColor,
+  nearestBlock,
+  gradient,
+  registryInfo,
 } from "./schem-builder.mjs";
 import { gableRoof, stairRun, tree, Heightmap } from "./prefabs.mjs";
 
@@ -103,6 +109,60 @@ test("discY places a single layer", () => {
   const st = s.stats();
   assert.equal(st.bounds.min[1], 3);
   assert.equal(st.bounds.max[1], 3);
+});
+
+test("ellipsoid yaw rotates the long axis from x to z", () => {
+  const flat = new Schem(16, 16, 16);
+  flat.ellipsoid(8, 8, 8, 6, 2, 2, blocks.stone);
+  assert.notEqual(flat.get(13, 8, 8), "minecraft:air"); // long along x
+  assert.equal(flat.get(8, 8, 13), "minecraft:air"); // short along z
+
+  const turned = new Schem(16, 16, 16);
+  turned.ellipsoid(8, 8, 8, 6, 2, 2, blocks.stone, { yaw: 90 });
+  assert.equal(turned.get(13, 8, 8), "minecraft:air"); // now short along x
+  assert.notEqual(turned.get(8, 8, 13), "minecraft:air"); // long along z
+});
+
+test("ellipsoid pitch tips the top toward +z; roll toward +x", () => {
+  const pitched = new Schem(16, 16, 16);
+  pitched.ellipsoid(8, 8, 8, 2, 6, 2, blocks.stone, { pitch: 90 });
+  assert.equal(pitched.get(8, 13, 8), "minecraft:air"); // no longer tall
+  assert.notEqual(pitched.get(8, 8, 13), "minecraft:air"); // long along z
+
+  const rolled = new Schem(16, 16, 16);
+  rolled.ellipsoid(8, 8, 8, 2, 6, 2, blocks.stone, { roll: 90 });
+  assert.equal(rolled.get(8, 13, 8), "minecraft:air");
+  assert.notEqual(rolled.get(13, 8, 8), "minecraft:air"); // long along x
+});
+
+test("rotated ellipsoid matches the unrotated shape's volume", () => {
+  const a = new Schem(20, 20, 20);
+  a.ellipsoid(10, 10, 10, 7, 3, 3, blocks.stone);
+  const b = new Schem(20, 20, 20);
+  b.ellipsoid(10, 10, 10, 7, 3, 3, blocks.stone, { yaw: 90 });
+  const na = a.stats().nonAir;
+  const nb = b.stats().nonAir;
+  assert.ok(Math.abs(na - nb) / na < 0.1, `volumes differ too much: ${na} vs ${nb}`);
+});
+
+test("torus rings around y with an open center", () => {
+  const s = new Schem(24, 8, 24);
+  s.torus(12, 4, 12, 8, 2, blocks.gold);
+  assert.notEqual(s.get(20, 4, 12), "minecraft:air"); // on the ring (+x)
+  assert.notEqual(s.get(12, 4, 20), "minecraft:air"); // on the ring (+z)
+  assert.equal(s.get(12, 4, 12), "minecraft:air"); // center hole
+  assert.equal(s.get(12, 7, 12), "minecraft:air"); // above the hole
+  const st = s.stats();
+  assert.ok(st.bounds.max[1] - st.bounds.min[1] <= 4); // tube is 2r thick
+});
+
+test("torus stands upright with axis x or z; bad axis throws", () => {
+  const s = new Schem(24, 24, 8);
+  s.torus(12, 12, 4, 8, 2, blocks.gold, { axis: "z" }); // ring in the xy plane
+  assert.notEqual(s.get(20, 12, 4), "minecraft:air"); // side of the ring
+  assert.notEqual(s.get(12, 20, 4), "minecraft:air"); // top of the ring
+  assert.equal(s.get(12, 12, 4), "minecraft:air"); // center hole
+  assert.throws(() => s.torus(0, 0, 0, 4, 1, blocks.stone, { axis: "w" }), /Unknown torus axis/);
 });
 
 test("arch spans between its feet and stays open underneath", () => {
@@ -331,7 +391,7 @@ test("save/loadSchem round-trips the example build", () => {
 });
 
 test("multi-byte VarInt palettes round-trip", () => {
-  const s = new Schem(16, 2, 16);
+  const s = new Schem(16, 2, 16, { validate: false }); // fake block names on purpose
   let i = 0;
   for (let z = 0; z < 16; z++) {
     for (let x = 0; x < 16; x++) {
@@ -343,4 +403,100 @@ test("multi-byte VarInt palettes round-trip", () => {
   s.save(file);
   const loaded = loadSchem(file);
   assert.deepEqual(loaded.blocks, s.blocks);
+});
+
+test("registry validates block names and states on write", () => {
+  assert.ok(registryInfo().blocks > 1000, "registry should know 1000+ blocks");
+
+  const s = new Schem(4, 4, 4);
+  assert.throws(() => s.set(0, 0, 0, "minecraft:stonebrick"), /did you mean "stone_bricks?"/);
+  assert.throws(() => s.fill(0, 0, 0, 1, 1, 1, "oak_stairs[facing=up]"), /Invalid value "up"/);
+  assert.throws(() => s.set(0, 0, 0, "stone[waterlogged=true]"), /has no state "waterlogged"/);
+  s.set(0, 0, 0, "sculk"); // any real block works, not just aliases
+  s.set(1, 0, 0, "mymod:custom_block"); // other namespaces are not validated
+
+  const loose = new Schem(4, 4, 4, { validate: false });
+  loose.set(0, 0, 0, "minecraft:not_a_block"); // opt-out for fakes/other versions
+  assert.equal(loose.get(0, 0, 0), "minecraft:not_a_block");
+});
+
+test("blockError reports problems without a schematic", () => {
+  assert.equal(blockError("minecraft:stone"), null);
+  assert.equal(blockError("minecraft:oak_leaves[distance=3,persistent=true]"), null);
+  assert.match(blockError("minecraft:oak_leaves[distance=9]"), /valid: 1, 2, 3, 4, 5, 6, 7/);
+  assert.match(blockError("minecraft:grass_blok"), /did you mean "grass_block"/);
+});
+
+test("blockColor, nearestBlock, and gradient use real texture colors", () => {
+  const gold = blockColor("gold_block");
+  assert.ok(gold[0] > 200 && gold[1] > 150 && gold[2] < 120, `gold_block should be yellow, got ${gold}`);
+  assert.deepEqual(blockColor("oak_stairs[facing=east]"), blockColor("oak_stairs")); // states ignored
+  assert.equal(blockColor("mymod:thing"), null);
+
+  const red = nearestBlock("#8e2020"); // red_concrete's exact color
+  assert.equal(red, "minecraft:red_concrete");
+  const notConcrete = nearestBlock("#8e2020", { exclude: ["red_concrete"] });
+  assert.notEqual(notConcrete, "minecraft:red_concrete");
+  const top3 = nearestBlock([255, 255, 255], { count: 3 });
+  assert.equal(top3.length, 3);
+
+  const ramp = gradient("black_concrete", "white_concrete", 5);
+  assert.equal(ramp.length, 5);
+  assert.equal(ramp[0], "minecraft:black_concrete");
+  assert.equal(ramp[4], "minecraft:white_concrete");
+  // every gradient step must be a placeable block
+  const s = new Schem(5, 1, 1);
+  ramp.forEach((name, i) => s.set(i, 0, 0, name));
+});
+
+test("nearestBlock defaults to full opaque cubes", () => {
+  // ask for pure white: snow/quartz-ish cubes should win, never glass or air
+  const names = nearestBlock([255, 255, 255], { count: 10 });
+  for (const n of names) {
+    assert.ok(!n.includes("glass") && !n.includes("air"), `${n} is not a solid cube`);
+  }
+});
+
+test("render-preview has real colors for the artistic palette", () => {
+  const dyes = [
+    "white", "orange", "magenta", "light_blue", "yellow", "lime", "pink", "gray",
+    "light_gray", "cyan", "purple", "blue", "brown", "green", "red", "black",
+  ];
+  const names = [];
+  for (const d of dyes) {
+    names.push(
+      `${d}_wool`, `${d}_terracotta`, `${d}_glazed_terracotta`,
+      `${d}_concrete`, `${d}_concrete_powder`, `${d}_stained_glass`,
+    );
+  }
+  names.push(
+    // derived variants: waxed copper, panes, carpet, stairs/slabs/walls/fences
+    "copper_block", "exposed_copper", "weathered_copper", "oxidized_copper",
+    "waxed_oxidized_copper", "waxed_cut_copper_stairs", "cut_copper_slab",
+    "purple_stained_glass_pane", "red_carpet", "stone_brick_wall",
+    "oak_fence", "spruce_fence_gate", "quartz_stairs", "purpur_slab",
+    "obsidian", "end_stone", "amethyst_block", "bone_block",
+    // registry-only blocks (no hand-tuned entry, colors from block-data.json)
+    "sculk", "ochre_froglight", "verdant_froglight", "pearlescent_froglight",
+    "cherry_leaves", "pale_oak_planks", "mushroom_stem", "crying_obsidian",
+    "warped_wart_block", "dripstone_block", "rooted_dirt", "sea_pickle",
+  );
+  const scene = path.join(tmp, "palette-scene.mjs");
+  fs.writeFileSync(scene, `
+    const names = ${JSON.stringify(names)};
+    export default function ({ Schem }) {
+      const side = Math.ceil(Math.sqrt(names.length));
+      const s = new Schem(side, 1, side);
+      names.forEach((n, i) => s.set(i % side, 0, Math.floor(i / side), "minecraft:" + n));
+      return s;
+    }
+  `);
+  const out = spawnSync(
+    process.execPath,
+    ["render-preview.mjs", scene, path.join(tmp, "palette"), "--views", "top"],
+    { cwd: import.meta.dirname, encoding: "utf8" },
+  );
+  assert.equal(out.status, 0, out.stderr);
+  assert.ok(!out.stdout.includes("no color entry for"), `fallback colors used:\n${out.stdout}`);
+  assert.ok(fs.existsSync(path.join(tmp, "palette-top.png")));
 });
